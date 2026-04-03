@@ -1,18 +1,11 @@
 import { defineConfig, type PluginOption } from 'vite'
 import react from '@vitejs/plugin-react'
-import vercel from 'vite-plugin-vercel/vite'
-import { getVercelEntries } from 'vite-plugin-vercel'
-
-// Vercel API 路由入口配置
-const vercelEntries = await getVercelEntries('endpoints/api', {
-  destination: 'api',
-})
 
 function youtubeProxyPlugin(): PluginOption {
   return {
     name: 'youtube-proxy',
     configureServer(server) {
-      // 开发环境代理: /api/yt-proxy/v3/search?... → Google: https://www.googleapis.com/youtube/v3/search?...
+      // 前端请求: /api/yt-proxy/v3/search?... → Google: https://www.googleapis.com/youtube/v3/search?...
       server.middlewares.use('/api/yt-proxy', (req, res) => {
         const originalUrl = req.url || '';
         const targetUrl = 'https://www.googleapis.com/youtube' + originalUrl;
@@ -53,16 +46,7 @@ function youtubeProxyPlugin(): PluginOption {
 }
 
 export default defineConfig({
-  plugins: [
-    youtubeProxyPlugin(),
-    react(),
-    vercel({
-      entries: vercelEntries,
-      rewrites: [
-        { source: '/((?!api/).*)', destination: '/index.html' },
-      ],
-    }),
-  ],
+  plugins: [youtubeProxyPlugin(), react()],
   server: {
     port: 5173,
   },
