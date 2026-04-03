@@ -59,7 +59,7 @@ export default defineConfig({
     vercel({
       entries: vercelEntries,
       rewrites: [
-        { src: '^/((?!api/).*)', dest: '/index.html' },
+        { source: '/((?!api/).*)', destination: '/index.html' },
       ],
     }),
   ],
