@@ -1,6 +1,6 @@
 {
   "rewrites": [
-    { "source": "/api/:path*", "destination": "/api/:path*" },
+    { "source": "/api/yt-proxy/:path*", "destination": "/api/yt-proxy/index?path=:path" },
     { "source": "/((?!api/).*)", "destination": "/index.html" }
   ]
 }

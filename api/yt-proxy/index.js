@@ -1,5 +1,5 @@
 // Vercel Serverless Function: YouTube API 代理
-// 捕获所有 /api/yt-proxy/* 请求并转发到 Google YouTube Data API
+// 接收 /api/yt-proxy/* 请求并转发到 Google YouTube Data API
 
 export const config = {
   api: {
@@ -8,7 +8,6 @@ export const config = {
 };
 
 export default async function handler(req, res) {
-  // 只允许 GET 和 OPTIONS 请求
   if (req.method === 'OPTIONS') {
     res.status(200)
       .setHeader('Access-Control-Allow-Origin', '*')
@@ -23,31 +22,28 @@ export default async function handler(req, res) {
     return;
   }
 
-  // 获取路径参数 - 支持多种格式
-  let pathParts = [];
+  // 从 rewrite 传入的 path query 参数获取子路径
+  const rawPath = req.query.path || '';
+  const pathParts = Array.isArray(rawPath) ? rawPath : [rawPath];
 
-  if (req.query.path) {
-    pathParts = Array.isArray(req.query.path) ? req.query.path : [req.query.path];
-  } else if (req.query['...path']) {
-    const raw = req.query['...path'];
-    pathParts = raw.split('/');
-  } else {
-    // 兜底: 从 URL 路径解析
-    const urlPath = (req.url || '').split('?')[0] || '';
-    const match = urlPath.match(/\/api\/yt-proxy\/(.+)/);
-    if (match) {
-      pathParts = match[1].split('/');
-    }
-  }
-
-  if (pathParts.length === 0) {
+  if (pathParts.length === 0 || !pathParts[0]) {
     res.status(400).json({ error: { message: 'Missing API path' } });
     return;
   }
 
-  const searchParams = (req.url || '').split('?')[1] || '';
   const apiPath = '/' + pathParts.join('/');
-  const targetUrl = `https://www.googleapis.com/youtube${apiPath}${searchParams ? '?' + searchParams : ''}`;
+  
+  // 获取原始 URL 中的 query 参数（排除 path 参数）
+  const url = new URL(req.url || '', 'http://localhost');
+  const searchParams = new URLSearchParams();
+  for (const [key, value] of url.searchParams.entries()) {
+    if (key !== 'path') {
+      searchParams.append(key, value);
+    }
+  }
+  const queryString = searchParams.toString();
+  
+  const targetUrl = `https://www.googleapis.com/youtube${apiPath}${queryString ? '?' + queryString : ''}`;
 
   console.log(`[YT Proxy] ${req.url} -> ${targetUrl}`);
 
