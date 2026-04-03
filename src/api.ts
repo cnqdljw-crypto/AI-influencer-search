@@ -1,10 +1,54 @@
 // YouTube Data API v3 服务层（Google 官方免费 API）
 // 文档: https://developers.google.com/youtube/v3/docs
-// 免费额度: 每天 10,000 配额单位（≈100 次搜索 + 9000 次详情查询）
+// 免费额度: 每天 10,000 配额单位
+// search.list = 100 单位/次, channels.list = 1 单位/次, videos.list = 1 单位/次
+// playlistItems.list = 1 单位/次
 // 无需付费，配额每 24 小时重置
 
 const YT_API_BASE = '/api/yt-proxy';
 const STORAGE_KEY = 'yt_api_key';
+
+// ========================
+// 活跃度缓存（localStorage，2小时有效）
+// 避免重复检测同一频道，大幅节省配额
+// ========================
+const ACTIVITY_CACHE_KEY = 'yt_activity_cache';
+const ACTIVITY_CACHE_TTL = 2 * 60 * 60 * 1000; // 2小时
+
+interface ActivityCacheEntry {
+  channelId: string;
+  hasLongVideo: boolean;
+  lastActiveDate: string | undefined;
+  recentAvgViews: number;
+  timestamp: number;
+}
+
+function loadActivityCache(): Map<string, ActivityCacheEntry> {
+  try {
+    const raw = localStorage.getItem(ACTIVITY_CACHE_KEY);
+    if (!raw) return new Map();
+    const arr: ActivityCacheEntry[] = JSON.parse(raw);
+    const now = Date.now();
+    const map = new Map<string, ActivityCacheEntry>();
+    for (const entry of arr) {
+      if (now - entry.timestamp < ACTIVITY_CACHE_TTL) {
+        map.set(entry.channelId, entry);
+      }
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+
+function saveActivityCache(cache: Map<string, ActivityCacheEntry>): void {
+  try {
+    const arr = Array.from(cache.values());
+    localStorage.setItem(ACTIVITY_CACHE_KEY, JSON.stringify(arr));
+  } catch {
+    // localStorage 满了或不可用，忽略
+  }
+}
 
 export function getApiKey(): string {
   return localStorage.getItem(STORAGE_KEY) || '';
@@ -94,6 +138,11 @@ interface YTChannelItem {
       keywords?: string;
     };
   };
+  contentDetails?: {
+    relatedPlaylists?: {
+      uploads?: string;
+    };
+  };
 }
 
 // ========================
@@ -143,7 +192,7 @@ async function ytApiGet<T>(endpoint: string, params: Record<string, string> = {}
  * 搜索 YouTube 频道
  * 消耗配额: 100 单位/次
  */
-export async function searchYouTubeChannels(query: string, maxResults = 12, regionCode?: string): Promise<YTSearchItem[]> {
+export async function searchYouTubeChannels(query: string, maxResults = 10, regionCode?: string): Promise<YTSearchItem[]> {
   const params: Record<string, string> = {
     part: 'snippet',
     q: query,
@@ -163,6 +212,7 @@ export async function searchYouTubeChannels(query: string, maxResults = 12, regi
 /**
  * 批量获取频道详情（粉丝数、视频数、总播放量等）
  * 消耗配额: 1 单位/次（最多50个频道）
+ * 同时获取 uploadsPlaylistId 用于后续活跃度检测
  */
 export async function getYouTubeChannelsDetails(channelIds: string[]): Promise<YTChannelItem[]> {
   if (channelIds.length === 0) return [];
@@ -176,7 +226,7 @@ export async function getYouTubeChannelsDetails(channelIds: string[]): Promise<Y
   const allChannels: YTChannelItem[] = [];
   for (const batch of batches) {
     const data = await ytApiGet<YTChannelResponse>('/v3/channels', {
-      part: 'snippet,statistics,brandingSettings',
+      part: 'snippet,statistics,brandingSettings,contentDetails',
       id: batch.join(','),
     });
     allChannels.push(...data.items);
@@ -253,85 +303,125 @@ const COUNTRY_SEARCH_NAMES: Record<string, string[]> = {
   PL: ['Poland', 'Polish'],
 };
 
+// playlistItems.list 的响应类型
+interface YTPlaylistItemsResponse {
+  items: Array<{
+    snippet?: {
+      publishedAt: string;
+      resourceId?: {
+        videoId?: string;
+        kind?: string;
+      };
+    };
+  }>;
+}
+
 /**
- * 检查频道近一个月是否有长视频（时长 ≥ 60 秒，排除 shorts）
- * 同时返回频道最后活跃日期
- * 流程: search.list(视频, publishedAfter) → video.list(时长) → 判断
+ * 检查频道近期活跃情况（优化版）
+ *
+ * 优化策略：
+ * 1. 先查 localStorage 缓存（2小时有效），命中则 0 配额消耗
+ * 2. 未命中时，用 playlistItems.list 代替 search.list：
+ *    - search.list(type=video, channelId) = 100 单位
+ *    - playlistItems.list(playlistId) = 1 单位
+ *    - channels.list 额外取 contentDetails.relatedPlaylists.uploads = 已有调用，0 额外消耗
+ * 3. 最多检查最近 5 个视频，只对非 shorts 视频查时长
+ *
+ * 流程: playlistItems.list(uploads, recent) → video.list(时长+播放量) → 判断
  */
-async function checkChannelRecentActivity(channelId: string): Promise<{
+async function checkChannelRecentActivity(
+  channelId: string,
+  uploadsPlaylistId: string | undefined,
+  cache: Map<string, ActivityCacheEntry>
+): Promise<{
   hasLongVideo: boolean;
   lastActiveDate: string | undefined;
   recentAvgViews: number;
 }> {
+  // 1. 检查缓存
+  const cached = cache.get(channelId);
+  if (cached) {
+    console.log(`[YT] Channel ${channelId}: using cached activity data`);
+    return {
+      hasLongVideo: cached.hasLongVideo,
+      lastActiveDate: cached.lastActiveDate,
+      recentAvgViews: cached.recentAvgViews,
+    };
+  }
+
   try {
-    const oneMonthAgo = new Date();
-    oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
-    const publishedAfter = oneMonthAgo.toISOString();
+    // 2. 获取频道最近视频
+    // 优先使用 uploadsPlaylistId（1单位），回退到 search（100单位）
+    let videoIds: string[] = [];
+    let latestPublishDate: string | undefined;
 
-    // 搜索该频道近一个月的视频
-    const searchData = await ytApiGet<YTSearchResponse>('/v3/search', {
-      part: 'snippet',
-      channelId,
-      type: 'video',
-      maxResults: '10',
-      order: 'date',
-      publishedAfter,
-    });
-
-    const videos = searchData.items
-      .filter(item => item.id.kind === 'youtube#video')
-      .map(item => ({
-        videoId: item.id.videoId!,
-        publishedAt: item.snippet.publishedAt,
-      }))
-      .filter(v => v.videoId);
-
-    if (videos.length === 0) {
-      // 近一个月没有视频，尝试搜索更早的（最近半年内）获取最后活跃日期
-      const sixMonthsAgo = new Date();
-      sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+    if (uploadsPlaylistId) {
       try {
-        const olderData = await ytApiGet<YTSearchResponse>('/v3/search', {
+        const playlistData = await ytApiGet<YTPlaylistItemsResponse>('/v3/playlistItems', {
           part: 'snippet',
-          channelId,
-          type: 'video',
-          maxResults: '1',
-          order: 'date',
-          publishedAfter: sixMonthsAgo.toISOString(),
+          playlistId: uploadsPlaylistId,
+          maxResults: '5',
         });
-        const lastVideo = olderData.items.find(i => i.id.kind === 'youtube#video');
-        const lastActiveDate = lastVideo?.snippet?.publishedAt;
-        console.log(`[YT] Channel ${channelId}: no videos in last month, lastActive=${lastActiveDate || 'unknown'}`);
-        return { hasLongVideo: false, lastActiveDate, recentAvgViews: 0 };
-      } catch {
-        return { hasLongVideo: false, lastActiveDate: undefined, recentAvgViews: 0 };
+        videoIds = playlistData.items
+          .map(item => item.snippet?.resourceId?.videoId)
+          .filter(Boolean) as string[];
+        latestPublishDate = playlistData.items[0]?.snippet?.publishedAt;
+        console.log(`[YT] Channel ${channelId}: got ${videoIds.length} recent videos from playlist (1 quota)`);
+      } catch (err) {
+        console.warn(`[YT] playlistItems failed for ${channelId}, falling back to search`, err);
       }
     }
 
-    // 获取最新视频的发布时间
-    const latestPublishDate = videos[0].publishedAt;
+    // 回退方案：使用 search.list（100单位）
+    if (videoIds.length === 0) {
+      const oneMonthAgo = new Date();
+      oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
+      const searchData = await ytApiGet<YTSearchResponse>('/v3/search', {
+        part: 'snippet',
+        channelId,
+        type: 'video',
+        maxResults: '5',
+        order: 'date',
+        publishedAfter: oneMonthAgo.toISOString(),
+      });
+      videoIds = searchData.items
+        .filter(item => item.id.kind === 'youtube#video')
+        .map(item => item.id.videoId!)
+        .filter(Boolean);
+      latestPublishDate = searchData.items[0]?.snippet?.publishedAt;
+      console.log(`[YT] Channel ${channelId}: fallback to search.list (100 quota)`);
+    }
 
-    // 批量获取视频详情（含时长 + 播放量）
-    const videoIds = videos.map(v => v.videoId);
+    if (videoIds.length === 0) {
+      const result = { hasLongVideo: false, lastActiveDate: undefined, recentAvgViews: 0 };
+      cache.set(channelId, { channelId, ...result, timestamp: Date.now() });
+      return result;
+    }
+
+    // 3. 批量获取视频详情（时长 + 播放量），1单位
     const videoData = await ytApiGet<YTVideoListResponse>('/v3/videos', {
       part: 'contentDetails,statistics',
       id: videoIds.join(','),
     });
 
-    // 检查是否有时长 ≥ 60 秒的视频（非 shorts），同时累计播放量
     let hasLong = false;
     let totalViews = 0;
     for (const video of videoData.items) {
       const durationSec = parseISODuration(video.contentDetails.duration);
-      if (durationSec >= 60) {
-        hasLong = true;
-      }
+      if (durationSec >= 60) hasLong = true;
       totalViews += parseInt(video.statistics?.viewCount || '0', 10);
     }
-    const recentAvgViews = Math.round(totalViews / videoData.items.length);
+    const recentAvgViews = videoData.items.length > 0
+      ? Math.round(totalViews / videoData.items.length)
+      : 0;
 
-    console.log(`[YT] Channel ${channelId}: ${videos.length} videos in last month, hasLong=${hasLong}, recentAvgViews=${recentAvgViews}, latest=${latestPublishDate}`);
-    return { hasLongVideo: hasLong, lastActiveDate: latestPublishDate, recentAvgViews };
+    console.log(`[YT] Channel ${channelId}: ${videoIds.length} videos, hasLong=${hasLong}, avgViews=${recentAvgViews}`);
+
+    // 4. 写入缓存
+    const result = { hasLongVideo: hasLong, lastActiveDate: latestPublishDate, recentAvgViews };
+    cache.set(channelId, { channelId, ...result, timestamp: Date.now() });
+
+    return result;
   } catch (err) {
     console.warn(`[YT] Failed to check activity for channel ${channelId}`, err);
     return { hasLongVideo: false, lastActiveDate: undefined, recentAvgViews: 0 };
@@ -340,38 +430,66 @@ async function checkChannelRecentActivity(channelId: string): Promise<{
 
 /**
  * 为达人列表批量检查近期活跃情况
- * 并行检查，每个频道独立，单个失败不影响其他
- * 返回: 检测后的达人列表 + 总计有长视频的数量
+ * 优化：最多检测 MAX_CHECK 个频道，带 localStorage 缓存（2小时有效）
+ * 并行检查，单个失败不影响其他
  */
-export async function enrichWithLongVideoCheck(influencers: Influencer[]): Promise<Influencer[]> {
-  const CONCURRENCY = 5;
-  const results: Influencer[] = [];
+export async function enrichWithLongVideoCheck(
+  influencers: Influencer[],
+  uploadsMap?: Map<string, string> // channelId → uploadsPlaylistId
+): Promise<Influencer[]> {
+  // 最多检测前 MAX_CHECK 个（避免配额浪费）
+  const MAX_CHECK = 10;
+  const ytInfluencers = influencers.filter(
+    inf => inf.platform === 'youtube' && inf._isReal
+  );
+  const toCheck = ytInfluencers.slice(0, MAX_CHECK);
 
-  for (let i = 0; i < influencers.length; i += CONCURRENCY) {
-    const batch = influencers.slice(i, i + CONCURRENCY);
+  if (toCheck.length === 0) return influencers;
+
+  // 加载缓存
+  const cache = loadActivityCache();
+  const CONCURRENCY = 5;
+  const results: Map<string, Influencer> = new Map();
+
+  for (let i = 0; i < toCheck.length; i += CONCURRENCY) {
+    const batch = toCheck.slice(i, i + CONCURRENCY);
     const enriched = await Promise.all(
       batch.map(async (inf) => {
-        if (inf.platform === 'youtube' && inf._isReal) {
-          const channelId = inf.id.replace('yt_', '');
-          const { hasLongVideo, lastActiveDate, recentAvgViews } = await checkChannelRecentActivity(channelId);
-          return { ...inf, hasLongVideoRecent: hasLongVideo, lastActiveDate, avgViews: recentAvgViews || inf.avgViews };
-        }
-        return inf;
+        const channelId = inf.id.replace('yt_', '');
+        const uploadsId = uploadsMap?.get(channelId);
+        const { hasLongVideo, lastActiveDate, recentAvgViews } = await checkChannelRecentActivity(
+          channelId, uploadsId, cache
+        );
+        return { ...inf, hasLongVideoRecent: hasLongVideo, lastActiveDate, avgViews: recentAvgViews || inf.avgViews };
       })
     );
-    results.push(...enriched);
+    for (const inf of enriched) {
+      results.set(inf.id, inf);
+    }
   }
 
-  return results;
+  // 保存缓存
+  saveActivityCache(cache);
+
+  // 构建最终结果：已检测的 + 未检测的（原样返回）
+  return influencers.map(inf => {
+    if (results.has(inf.id)) return results.get(inf.id)!;
+    return inf;
+  });
 }
 
 /**
  * YouTube 关键词搜索达人（使用 YouTube Data API v3）
- * 流程: search.list(channel) → channels.list(details)
+ * 流程: search.list(channel) → channels.list(details + contentDetails)
  * 支持多国家：使用本地化关键词搜索 + regionCode 排序偏好 + 去重合并
+ *
+ * 优化：减少默认搜索结果数量，获取 uploadsPlaylistId 用于活跃度检测
  */
-export async function searchYouTubeInfluencers(keyword: string, countries?: string[]): Promise<Influencer[]> {
-  if (!keyword.trim()) return [];
+export async function searchYouTubeInfluencers(keyword: string, countries?: string[]): Promise<{
+  influencers: Influencer[];
+  uploadsMap: Map<string, string>; // channelId → uploadsPlaylistId
+}> {
+  if (!keyword.trim()) return { influencers: [], uploadsMap: new Map() };
 
   const countryList = countries && countries.length > 0 ? countries.filter(c => c !== 'OTHER') : [];
   const includeOther = countries?.includes('OTHER') ?? false;
@@ -415,27 +533,25 @@ export async function searchYouTubeInfluencers(keyword: string, countries?: stri
   };
 
   if (countryList.length === 0) {
-    // 不限地区：用 relevance + date 两种排序各搜一次
-    await doSearch(keyword, 15, undefined, 'relevance');
-    await doSearch(keyword, 10, undefined, 'date');
+    // 不限地区：减少搜索量，relevance + date 各搜一次（原 15+10 → 10+5）
+    await doSearch(keyword, 10, undefined, 'relevance');
+    await doSearch(keyword, 5, undefined, 'date');
   } else {
-    // 逐个国家搜索
+    // 逐个国家搜索（减少每个国家的搜索量）
     for (const code of countryList) {
       const localNames = COUNTRY_SEARCH_NAMES[code] || [code];
 
-      // 策略 1: 用本地化国家名 + 关键词搜索（relevance）
-      for (const localName of localNames.slice(0, 2)) {
-        await doSearch(`${localName} ${keyword}`, 6, code, 'relevance');
-      }
+      // 策略 1: 用本地化国家名 + 关键词搜索（relevance），只用第一个本地名（原 2个 → 1个）
+      await doSearch(`${localNames[0]} ${keyword}`, 5, code, 'relevance');
 
       // 策略 2: 用关键词 + regionCode 排序（date 排序，找近期活跃的）
-      await doSearch(keyword, 6, code, 'date');
+      await doSearch(keyword, 5, code, 'date');
     }
   }
 
   // "其他国家"
   if (includeOther) {
-    await doSearch(keyword, 10, undefined, 'relevance');
+    await doSearch(keyword, 5, undefined, 'relevance');
   }
 
   console.log(`[YT] total ${allSearchResults.length} unique channels found`);
@@ -444,21 +560,29 @@ export async function searchYouTubeInfluencers(keyword: string, countries?: stri
     if (errors.length > 0) {
       throw new Error(errors[0]);
     }
-    return [];
+    return { influencers: [], uploadsMap: new Map() };
   }
 
-  // 第二步：提取频道 ID 并批量获取详情
+  // 第二步：提取频道 ID 并批量获取详情（含 contentDetails 获取 uploadsPlaylistId）
   const channelIds = allSearchResults.map((item) => item.id.channelId!).filter(Boolean);
 
-  let channels: YTChannelItem[];
+  let channels: YTChannelItem[] = [];
   try {
     channels = await getYouTubeChannelsDetails(channelIds);
   } catch (err) {
     console.warn('[YT] Failed to get channel details, using search data only', err);
-    channels = [];
   }
 
   console.log(`[YT] got details for ${channels.length}/${channelIds.length} channels`);
+
+  // 构建 uploadsPlaylistId 映射（用于活跃度检测优化）
+  const uploadsMap = new Map<string, string>();
+  for (const ch of channels) {
+    const uploadsId = ch.contentDetails?.relatedPlaylists?.uploads;
+    if (uploadsId) {
+      uploadsMap.set(ch.id, uploadsId);
+    }
+  }
 
   // 第三步：合并搜索结果和频道详情
   const channelMap = new Map(channels.map((ch) => [ch.id, ch]));
@@ -517,11 +641,5 @@ export async function searchYouTubeInfluencers(keyword: string, countries?: stri
     };
   });
 
-  return influencers;
+  return { influencers, uploadsMap };
 }
-
-
-
-
-
-

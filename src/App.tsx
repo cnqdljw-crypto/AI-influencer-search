@@ -66,17 +66,17 @@ function App() {
       try {
         console.log('[App] Searching YouTube API for:', keyword, 'countries:', filters.countries);
 
-        // 先执行基础搜索
+        // 先执行基础搜索（返回达人列表 + uploadsPlaylistId 映射）
         const { searchYouTubeInfluencers } = await import('./api');
-        const apiResults = await searchYouTubeInfluencers(keyword, filters.countries);
+        const { influencers: apiResults, uploadsMap } = await searchYouTubeInfluencers(keyword, filters.countries);
         console.log('[App] YouTube API returned:', apiResults.length, 'influencers');
 
-        // 自动检测所有频道的活跃度 + 长视频情况
+        // 自动检测频道的活跃度 + 长视频情况（最多检测前10个，带缓存）
         let finalResults = apiResults;
         if (apiResults.length > 0) {
           setError('正在检查每个频道的活跃情况，请稍候...');
           const { enrichWithLongVideoCheck } = await import('./api');
-          finalResults = await enrichWithLongVideoCheck(apiResults);
+          finalResults = await enrichWithLongVideoCheck(apiResults, uploadsMap);
           const activeCount = finalResults.filter(inf => {
             if (!inf.lastActiveDate) return false;
             const diffDays = (Date.now() - new Date(inf.lastActiveDate).getTime()) / (24 * 60 * 60 * 1000);
