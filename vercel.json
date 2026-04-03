@@ -1,11 +1,7 @@
 {
   "framework": null,
-  "buildCommand": "npm run build",
-  "outputDirectory": "dist",
   "installCommand": "npm install",
-  "rewrites": [
-    { "source": "/((?!api/).*)", "destination": "/index.html" }
-  ],
+  "buildCommand": "npx vite build",
   "headers": [
     {
       "source": "/assets/(.*)",
